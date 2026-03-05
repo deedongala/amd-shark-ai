@@ -12,6 +12,7 @@ from iree.compiler import ir  # type: ignore
 from iree.compiler.dialects import iree_codegen, iree_gpu, transform  # type: ignore
 
 from amdsharktuner import candidate_gen, common
+from amdsharktuner.rocm import rocm_common, rocm_tuners
 
 from amdsharktuner.test_utils import tuner_ctx
 
@@ -49,8 +50,8 @@ def test_get_td_spec_contraction(tuner_ctx: common.TunerContext) -> None:
                         affine_map<(d0, d1, d2) -> (d0, d2)>,
                         affine_map<(d0, d1, d2) -> (d1, d2)>,
                         affine_map<(d0, d1, d2) -> (d0, d1)>],
-                    iterator_types = ["parallel", "parallel", "reduction"]}
-                    {root_op}
+                    iterator_types = ["parallel", "parallel", "reduction"],
+                    root_op = #iree_codegen.root_op<set = 0>}
                     ins(%arg0, %arg1 : tensor<2048x2048xf16>, tensor<2048x2048xf16>)
                     outs(%1 : tensor<2048x2048xf32>) {
                 ^bb0(%in: f16, %in_0: f16, %out: f32):
@@ -77,7 +78,9 @@ def test_get_td_spec_contraction(tuner_ctx: common.TunerContext) -> None:
         iree_codegen.DispatchLoweringPassPipeline.LLVMGPUVectorDistribute
     )
     pipeline_options = iree_gpu.PipelineOptionsAttr.get(prefetch_num_stages=2)
-    config_dict = common.get_translation_info_config(pipeline_options, waves_per_eu=8)
+    config_dict = rocm_common.get_translation_info_config(
+        pipeline_options, waves_per_eu=8
+    )
     translation_info = iree_codegen.TranslationInfoAttr.get(
         pipeline_attr, None, [16, 16, 1], 16, config_dict
     )
@@ -90,7 +93,7 @@ def test_get_td_spec_contraction(tuner_ctx: common.TunerContext) -> None:
     assert len(root_op_list) == 1
     root_op = root_op_list[0]
 
-    tuner = candidate_gen.ContractionOpInterfaceTuner(root_op, tuner_ctx)
+    tuner = rocm_tuners.ROCmContractionVectorDistributeTuner(root_op, tuner_ctx)
     td_spec_module = tuner.get_td_spec(
         [common.TuningConfiguration("compilation_info", compilation_info)]
     )
@@ -140,7 +143,7 @@ def test_get_td_spec_convolution(tuner_ctx: common.TunerContext) -> None:
                 %cst = arith.constant 0 : i32
                 %0 = tensor.empty() : tensor<2x32x32x2048xi32>
                 %1 = linalg.fill ins(%cst : i32) outs(%0 : tensor<2x32x32x2048xi32>) -> tensor<2x32x32x2048xi32>
-                %2 = linalg.conv_2d_nhwc_hwcf {root_op}
+                %2 = linalg.conv_2d_nhwc_hwcf {root_op = #iree_codegen.root_op<set = 0>}
                     ins(%arg0, %arg1 : tensor<2x34x34x2048xi8>, tensor<3x3x2048x2048xi8>)
                     outs(%1 : tensor<2x32x32x2048xi32>) -> tensor<2x32x32x2048xi32>
                 return %2 : tensor<2x32x32x2048xi32>
@@ -160,7 +163,9 @@ def test_get_td_spec_convolution(tuner_ctx: common.TunerContext) -> None:
         iree_codegen.DispatchLoweringPassPipeline.LLVMGPUVectorDistribute
     )
     pipeline_options = iree_gpu.PipelineOptionsAttr.get(prefetch_num_stages=0)
-    config_dict = common.get_translation_info_config(pipeline_options, waves_per_eu=2)
+    config_dict = rocm_common.get_translation_info_config(
+        pipeline_options, waves_per_eu=2
+    )
     translation_info = iree_codegen.TranslationInfoAttr.get(
         pipeline_attr, None, [256, 1, 1], 64, config_dict
     )
@@ -172,7 +177,7 @@ def test_get_td_spec_convolution(tuner_ctx: common.TunerContext) -> None:
     root_op_list = iree_codegen.get_tuner_root_ops(ir_module)
     assert len(root_op_list) == 1
     root_op = root_op_list[0]
-    tuner = candidate_gen.ConvolutionOpInterfaceTuner(root_op, tuner_ctx)
+    tuner = rocm_tuners.ROCmConvolutionVectorDistributeTuner(root_op, tuner_ctx)
     td_spec_module = tuner.get_td_spec(
         [common.TuningConfiguration("compilation_info", compilation_info)]
     )
@@ -217,14 +222,14 @@ def test_get_td_spec_convolution(tuner_ctx: common.TunerContext) -> None:
     )
 
 
-def test_set_dispatch_tuner_with_matvec(tuner_ctx: common.TunerContext) -> None:
+def test_instantiate_dispatch_tuner_with_matvec(tuner_ctx: common.TunerContext) -> None:
     # Make sure we do not crash on unsupported root ops (matvec).
     context = tuner_ctx.mlir_ctx
     module_str = """
         builtin.module{
             func.func @test(%A: tensor<8x224xf32>, %x: tensor<224xf32>) -> tensor<8xf32> {
                 %init = tensor.empty() : tensor<8xf32>
-                %y = linalg.matvec {root_op}
+                %y = linalg.matvec {root_op = #iree_codegen.root_op<set = 0>}
                     ins(%A, %x : tensor<8x224xf32>, tensor<224xf32>)
                     outs(%init : tensor<8xf32>) -> tensor<8xf32>
                 return %y : tensor<8xf32>
@@ -234,11 +239,16 @@ def test_set_dispatch_tuner_with_matvec(tuner_ctx: common.TunerContext) -> None:
     ir_module = ir.Module.parse(module_str, context)
 
     # Should return None since mat-vec has invalid dimensions (M=[]).
-    result = candidate_gen.set_dispatch_tuner(ir_module, tuner_ctx)
+    dispatch_tuners = candidate_gen.get_supported_dispatch_tuners(
+        "gfx942", iree_codegen.DispatchLoweringPassPipeline.LLVMGPUVectorDistribute
+    )
+    result = candidate_gen.instantiate_dispatch_tuner(
+        ir_module, tuner_ctx, dispatch_tuners
+    )
     assert result is None
 
 
-def test_set_dispatch_tuner_with_unsupported_conv(
+def test_instantiate_dispatch_tuner_with_unsupported_conv(
     tuner_ctx: common.TunerContext,
 ) -> None:
     # Make sure we do not crash on unsupported conv layouts (nchw_fchw).
@@ -249,7 +259,7 @@ def test_set_dispatch_tuner_with_unsupported_conv(
                 %cst = arith.constant 0 : i32
                 %0 = tensor.empty() : tensor<2x2048x32x32xi32>
                 %1 = linalg.fill ins(%cst : i32) outs(%0 : tensor<2x2048x32x32xi32>) -> tensor<2x2048x32x32xi32>
-                %2 = linalg.conv_2d_nchw_fchw {root_op}
+                %2 = linalg.conv_2d_nchw_fchw {root_op = #iree_codegen.root_op<set = 0>}
                     ins(%arg0, %arg1 : tensor<2x2048x34x34xi8>, tensor<2048x2048x3x3xi8>)
                     outs(%1 : tensor<2x2048x32x32xi32>) -> tensor<2x2048x32x32xi32>
                 return %2 : tensor<2x2048x32x32xi32>
@@ -259,11 +269,16 @@ def test_set_dispatch_tuner_with_unsupported_conv(
     ir_module = ir.Module.parse(module_str, context)
 
     # Should return None since conv with nchw_fchw layout is not supported.
-    result = candidate_gen.set_dispatch_tuner(ir_module, tuner_ctx)
+    dispatch_tuners = candidate_gen.get_supported_dispatch_tuners(
+        "gfx942", iree_codegen.DispatchLoweringPassPipeline.LLVMGPUVectorDistribute
+    )
+    result = candidate_gen.instantiate_dispatch_tuner(
+        ir_module, tuner_ctx, dispatch_tuners
+    )
     assert result is None
 
 
-def test_set_dispatch_tuner_no_root_op(tuner_ctx: common.TunerContext) -> None:
+def test_instantiate_dispatch_tuner_no_root_op(tuner_ctx: common.TunerContext) -> None:
     context = tuner_ctx.mlir_ctx
     module_str = """
         builtin.module{
@@ -278,19 +293,26 @@ def test_set_dispatch_tuner_no_root_op(tuner_ctx: common.TunerContext) -> None:
     ir_module = ir.Module.parse(module_str, context)
 
     # Should return None since no root_op is found.
-    result = candidate_gen.set_dispatch_tuner(ir_module, tuner_ctx)
+    dispatch_tuners = candidate_gen.get_supported_dispatch_tuners(
+        "gfx942", iree_codegen.DispatchLoweringPassPipeline.LLVMGPUVectorDistribute
+    )
+    result = candidate_gen.instantiate_dispatch_tuner(
+        ir_module, tuner_ctx, dispatch_tuners
+    )
     assert result is None
 
 
-def test_set_dispatch_tuner_multiple_root_ops(tuner_ctx: common.TunerContext) -> None:
+def test_instantiate_dispatch_tuner_multiple_root_ops(
+    tuner_ctx: common.TunerContext,
+) -> None:
     context = tuner_ctx.mlir_ctx
     module_str = """
         builtin.module{
             func.func @test(%arg0: tensor<256xf32>, %arg1: tensor<256xf32>) -> tensor<256xf32> {
-                %0 = linalg.add {root_op}
+                %0 = linalg.add {root_op = #iree_codegen.root_op<set = 0>}
                     ins(%arg0, %arg1 : tensor<256xf32>, tensor<256xf32>)
                     outs(%arg0 : tensor<256xf32>) -> tensor<256xf32>
-                %1 = linalg.mul {root_op}
+                %1 = linalg.mul {root_op = #iree_codegen.root_op<set = 0>}
                     ins(%0, %0 : tensor<256xf32>, tensor<256xf32>)
                     outs(%0 : tensor<256xf32>) -> tensor<256xf32>
                 return %1 : tensor<256xf32>
@@ -300,5 +322,42 @@ def test_set_dispatch_tuner_multiple_root_ops(tuner_ctx: common.TunerContext) ->
     ir_module = ir.Module.parse(module_str, context)
 
     # Should return None since multiple root_ops are found.
-    result = candidate_gen.set_dispatch_tuner(ir_module, tuner_ctx)
+    dispatch_tuners = candidate_gen.get_supported_dispatch_tuners(
+        "gfx942", iree_codegen.DispatchLoweringPassPipeline.LLVMGPUVectorDistribute
+    )
+    result = candidate_gen.instantiate_dispatch_tuner(
+        ir_module, tuner_ctx, dispatch_tuners
+    )
     assert result is None
+
+
+def test_get_supported_dispatch_tuners() -> None:
+    Pipeline = iree_codegen.DispatchLoweringPassPipeline
+
+    assert candidate_gen.get_supported_dispatch_tuners(
+        "gfx942", Pipeline.LLVMGPUVectorDistribute
+    ) == [
+        rocm_tuners.ROCmContractionVectorDistributeTuner,
+        rocm_tuners.ROCmConvolutionVectorDistributeTuner,
+        rocm_tuners.ROCmAttentionVectorDistributeTuner,
+    ]
+
+    assert candidate_gen.get_supported_dispatch_tuners(
+        "gfx942", Pipeline.LLVMGPUTileAndFuse
+    ) == [
+        rocm_tuners.ROCmContractionTileAndFuseTuner,
+        rocm_tuners.ROCmConvolutionTileAndFuseTuner,
+    ]
+
+    assert (
+        candidate_gen.get_supported_dispatch_tuners(
+            "sm_80", Pipeline.LLVMGPUVectorDistribute
+        )
+        == []
+    )
+    assert (
+        candidate_gen.get_supported_dispatch_tuners(
+            "gfx942", Pipeline.LLVMGPUDistribute
+        )
+        == []
+    )
